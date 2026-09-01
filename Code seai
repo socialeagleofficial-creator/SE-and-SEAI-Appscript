@@ -1,0 +1,217 @@
+// ============================================================
+// SEAI - 2026 AD Spent data → SEAI_Master consolidation script
+// Paste this entire script into:
+//   Extensions → Apps Script → replace any existing code → Save → Run
+// First run: Google will ask for permissions — click Allow
+// ============================================================
+
+function consolidateSEAIMaster() {
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // ── 1. Create or clear the master sheet ──────────────────
+  let master = ss.getSheetByName('SEAI_Master');
+  if (!master) {
+    master = ss.insertSheet('SEAI_Master');
+  } else {
+    master.clearContents();
+  }
+
+  // ── 2. Write header row ───────────────────────────────────
+  const headers = [
+    'Month', 'Brand', 'Course', 'Conversion Type',
+    'Spend', 'Optins', 'Results', 'CPR',
+    'Conversions', 'Conversion Rate', 'CAC',
+    'Value Per Conversion', 'Revenue Thru Registration',
+    'Total Conversion Value', 'Total Revenue', 'ROAS',
+    'Budget Est Next 3M', 'Expected Results',
+    'Expected Conversions', 'Expected Revenue 3M'
+  ];
+  master.appendRow(headers);
+
+  // ── 3. Month order map ────────────────────────────────────
+  const monthOrder = {
+    'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4,
+    'may': 5, 'jun': 6, 'jul': 7, 'aug': 8,
+    'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12
+  };
+
+  const allSheets = ss.getSheets();
+  let rowsWritten = 0;
+
+  allSheets.forEach(sheet => {
+    const tabName = sheet.getName();
+
+    if (tabName === 'SEAI_Master') return;
+
+    // ── 4. Parse month from tab name ─────────────────────────
+    // Handles: "AI - May", "AI - Jun", "AI WORKSHOP - Jul", "AI - Aug 2026"
+    const monthMatch = tabName.match(/[-–]\s*([A-Za-z]+)\s*(\d{4})?$/);
+    if (!monthMatch) {
+      Logger.log('Skipping tab (no month found): ' + tabName);
+      return;
+    }
+
+    const monthName = monthMatch[1];
+    const year = monthMatch[2] || '2026';
+    const monthNum = monthOrder[monthName.toLowerCase()];
+    if (!monthNum) {
+      Logger.log('Skipping tab (unrecognised month): ' + tabName);
+      return;
+    }
+
+    const monthLabel = monthName.charAt(0).toUpperCase() +
+                       monthName.slice(1).toLowerCase() + ' ' + year;
+
+    // ── 5. Read data rows ─────────────────────────────────────
+    const data = sheet.getDataRange().getValues();
+    if (data.length < 2) return;
+
+    // Find header row
+    let headerRowIdx = -1;
+    for (let i = 0; i < Math.min(data.length, 5); i++) {
+      if (String(data[i][0]).toLowerCase().includes('course')) {
+        headerRowIdx = i;
+        break;
+      }
+    }
+    if (headerRowIdx === -1) {
+      Logger.log('No header row found in: ' + tabName);
+      return;
+    }
+
+    const headerRow = data[headerRowIdx].map(h => String(h).trim().toLowerCase());
+
+    function col(keywords) {
+      for (let k of keywords) {
+        const idx = headerRow.findIndex(h => h.includes(k));
+        if (idx !== -1) return idx;
+      }
+      return -1;
+    }
+
+    const colMap = {
+      course:         col(['course name']),
+      convType:       col(['conversion type']),
+      spend:          col(['monthly spend', 'spend']),
+      optins:         col(['optin']),
+      results:        col(['result']),
+      cpr:            col(['cpr']),
+      revReg:         col(['revenue thru registration']),
+      conversions:    col(['conversions']),
+      cvr:            col(['conversion rate']),
+      cac:            col(['cac']),
+      valuePerConv:   col(['value per conversion']),
+      totalConvVal:   col(['total conversion value']),
+      totalRevenue:   col(['total revenue']),
+      roas:           col(['roas']),
+      budgetEst:      col(['budget estimation']),
+      expResults:     col(['expected results']),
+      expConversions: col(['expected conversions']),
+      expRevenue:     col(['expected revenue'])
+    };
+
+    // ── 6. Process data rows ──────────────────────────────────
+    for (let i = headerRowIdx + 1; i < data.length; i++) {
+      const row = data[i];
+      const courseName = String(row[colMap.course] || '').trim();
+
+      if (!courseName || courseName.toLowerCase() === 'total') continue;
+
+      function cleanNum(val) {
+        if (val === '' || val === null || val === undefined) return 0;
+        const cleaned = String(val).replace(/[₹,\s]/g, '').replace('%', '');
+        const num = parseFloat(cleaned);
+        return isNaN(num) ? 0 : num;
+      }
+
+      function cleanPct(val) {
+        const cleaned = String(val).replace(/[₹,%\s]/g, '');
+        const num = parseFloat(cleaned);
+        return isNaN(num) ? 0 : num;
+      }
+
+      const masterRow = [
+        monthLabel,
+        'SEAI',
+        courseName,
+        colMap.convType >= 0 ? String(row[colMap.convType]).trim() : 'Full Course',
+        cleanNum(row[colMap.spend]),
+        cleanNum(row[colMap.optins]),
+        cleanNum(row[colMap.results]),
+        cleanNum(row[colMap.cpr]),
+        cleanNum(row[colMap.conversions]),
+        cleanPct(row[colMap.cvr]),
+        cleanNum(row[colMap.cac]),
+        cleanNum(row[colMap.valuePerConv]),
+        cleanNum(row[colMap.revReg]),
+        cleanNum(row[colMap.totalConvVal]),
+        cleanNum(row[colMap.totalRevenue]),
+        cleanNum(row[colMap.roas]),
+        cleanNum(row[colMap.budgetEst]),
+        cleanNum(row[colMap.expResults]),
+        cleanNum(row[colMap.expConversions]),
+        cleanNum(row[colMap.expRevenue])
+      ];
+
+      master.appendRow(masterRow);
+      rowsWritten++;
+    }
+
+    Logger.log('Processed tab: ' + tabName + ' → Month: ' + monthLabel);
+  });
+
+  // ── 7. Sort by month then course ──────────────────────────
+  const lastRow = master.getLastRow();
+  if (lastRow > 2) {
+    master.getRange(2, 1, lastRow - 1, headers.length)
+      .sort([{column: 1, ascending: true}, {column: 3, ascending: true}]);
+  }
+
+  // ── 8. Format numbers ─────────────────────────────────────
+  const numCols = [5, 8, 13, 14, 15, 17, 20];
+  numCols.forEach(c => {
+    if (lastRow > 1) {
+      master.getRange(2, c, lastRow - 1, 1).setNumberFormat('#,##0.00');
+    }
+  });
+  if (lastRow > 1) {
+    master.getRange(2, 16, lastRow - 1, 1).setNumberFormat('0.00');
+    master.getRange(2, 10, lastRow - 1, 1).setNumberFormat('0.00"%"');
+  }
+
+  // ── 9. Done ───────────────────────────────────────────────
+  SpreadsheetApp.getUi().alert(
+    'SEAI_Master created successfully!\n' +
+    rowsWritten + ' data rows written.\n\n' +
+    'New month tabs added later will be picked up\nautomatically when you run this script again,\nor set up the auto-trigger (Step 3).'
+  );
+
+  Logger.log('Done. Total rows written: ' + rowsWritten);
+}
+
+
+// ============================================================
+// AUTO-TRIGGER SETUP
+// Run once to enable nightly auto-consolidation
+// ============================================================
+
+function setupAutoTrigger() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'consolidateSEAIMaster') {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+
+  ScriptApp.newTrigger('consolidateSEAIMaster')
+    .timeBased()
+    .everyDays(1)
+    .atHour(0)
+    .create();
+
+  SpreadsheetApp.getUi().alert(
+    'Auto-trigger set!\n\n' +
+    'SEAI_Master will update automatically every night at midnight.\n' +
+    'New month tabs will be picked up without any manual action.'
+  );
+}
