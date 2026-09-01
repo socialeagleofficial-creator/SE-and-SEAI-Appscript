@@ -1,0 +1,236 @@
+// ============================================================
+// SE - 2026 AD Spent data → SE_Master consolidation script
+// Paste this entire script into:
+//   Extensions → Apps Script → replace any existing code → Save → Run
+// First run: Google will ask for permissions — click Allow
+// ============================================================
+
+function consolidateSEMaster() {
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // ── 1. Create or clear the master sheet ──────────────────
+  let master = ss.getSheetByName('SE_Master');
+  if (!master) {
+    master = ss.insertSheet('SE_Master');
+  } else {
+    master.clearContents();
+  }
+
+  // ── 2. Write header row ───────────────────────────────────
+  const headers = [
+    'Month', 'Brand', 'Course', 'Conversion Type',
+    'Spend', 'Optins', 'Results', 'CPR',
+    'Conversions', 'Conversion Rate', 'CAC',
+    'Value Per Conversion', 'Revenue Thru Registration',
+    'Total Conversion Value', 'Total Revenue', 'ROAS',
+    'Budget Est Next 3M', 'Expected Results',
+    'Expected Conversions', 'Expected Revenue 3M'
+  ];
+  master.appendRow(headers);
+
+  // ── 3. Tab name → month mapping ───────────────────────────
+  // Pattern: "COURSE - MON" e.g. "DM - May", "SOS - Jun"
+  // Script extracts month from tab name automatically
+  const monthOrder = {
+    'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4,
+    'may': 5, 'jun': 6, 'jul': 7, 'aug': 8,
+    'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12
+  };
+
+  const allSheets = ss.getSheets();
+  let rowsWritten = 0;
+
+  allSheets.forEach(sheet => {
+    const tabName = sheet.getName();
+
+    // Skip the master sheet itself and any utility sheets
+    if (tabName === 'SE_Master') return;
+
+    // ── 4. Parse month from tab name ─────────────────────────
+    // Handles: "DM - May", "DM - Aug 2026", "SOS - Jun", "DM 2DC - Jul"
+    const monthMatch = tabName.match(/[-–]\s*([A-Za-z]+)\s*(\d{4})?$/);
+    if (!monthMatch) {
+      Logger.log('Skipping tab (no month found): ' + tabName);
+      return;
+    }
+
+    const monthName = monthMatch[1];
+    const year = monthMatch[2] || '2026';
+    const monthNum = monthOrder[monthName.toLowerCase()];
+    if (!monthNum) {
+      Logger.log('Skipping tab (unrecognised month): ' + tabName);
+      return;
+    }
+
+    // Format as "May 2026", "Aug 2026" etc.
+    const monthLabel = monthName.charAt(0).toUpperCase() +
+                       monthName.slice(1).toLowerCase() + ' ' + year;
+
+    // ── 5. Read data rows from this tab ───────────────────────
+    const data = sheet.getDataRange().getValues();
+    if (data.length < 2) return;
+
+    // Find the header row (first row containing "Course Name")
+    let headerRowIdx = -1;
+    for (let i = 0; i < Math.min(data.length, 5); i++) {
+      if (String(data[i][0]).toLowerCase().includes('course')) {
+        headerRowIdx = i;
+        break;
+      }
+    }
+    if (headerRowIdx === -1) {
+      Logger.log('No header row found in: ' + tabName);
+      return;
+    }
+
+    const headerRow = data[headerRowIdx].map(h => String(h).trim().toLowerCase());
+
+    // Column index lookup helper
+    function col(keywords) {
+      for (let k of keywords) {
+        const idx = headerRow.findIndex(h => h.includes(k));
+        if (idx !== -1) return idx;
+      }
+      return -1;
+    }
+
+    // Map columns — handles variations like "Monthly Spend (Without GST)" vs "Monthly Spend"
+    const colMap = {
+      course:         col(['course name']),
+      convType:       col(['conversion type']),
+      spend:          col(['monthly spend', 'spend']),
+      optins:         col(['optin']),
+      results:        col(['result']),
+      cpr:            col(['cpr']),
+      revReg:         col(['revenue thru registration']),
+      conversions:    col(['conversions']),
+      cvr:            col(['conversion rate']),
+      cac:            col(['cac']),
+      valuePerConv:   col(['value per conversion']),
+      totalConvVal:   col(['total conversion value']),
+      totalRevenue:   col(['total revenue']),
+      roas:           col(['roas']),
+      budgetEst:      col(['budget estimation']),
+      expResults:     col(['expected results']),
+      expConversions: col(['expected conversions']),
+      expRevenue:     col(['expected revenue'])
+    };
+
+    // ── 6. Process each data row ──────────────────────────────
+    for (let i = headerRowIdx + 1; i < data.length; i++) {
+      const row = data[i];
+      const courseName = String(row[colMap.course] || '').trim();
+
+      // Skip blank rows and "Total" summary rows
+      if (!courseName || courseName.toLowerCase() === 'total') continue;
+
+      // Clean ₹ symbols and commas from numeric values
+      function cleanNum(val) {
+        if (val === '' || val === null || val === undefined) return 0;
+        const cleaned = String(val).replace(/[₹,\s]/g, '').replace('%', '');
+        const num = parseFloat(cleaned);
+        return isNaN(num) ? 0 : num;
+      }
+
+      // Clean percentage — store as decimal (9.37% → 9.37, not 0.0937)
+      function cleanPct(val) {
+        const cleaned = String(val).replace(/[₹,%\s]/g, '');
+        const num = parseFloat(cleaned);
+        return isNaN(num) ? 0 : num;
+      }
+
+      const masterRow = [
+        monthLabel,                                          // Month
+        'SE',                                                // Brand
+        courseName,                                          // Course
+        colMap.convType >= 0 ? String(row[colMap.convType]).trim() : 'Full Course',
+        cleanNum(row[colMap.spend]),                         // Spend (₹)
+        cleanNum(row[colMap.optins]),                        // Optins
+        cleanNum(row[colMap.results]),                       // Results
+        cleanNum(row[colMap.cpr]),                           // CPR
+        cleanNum(row[colMap.conversions]),                   // Conversions
+        cleanPct(row[colMap.cvr]),                           // Conversion Rate %
+        cleanNum(row[colMap.cac]),                           // CAC
+        cleanNum(row[colMap.valuePerConv]),                  // Value Per Conversion
+        cleanNum(row[colMap.revReg]),                        // Revenue Thru Registration
+        cleanNum(row[colMap.totalConvVal]),                  // Total Conversion Value
+        cleanNum(row[colMap.totalRevenue]),                  // Total Revenue
+        cleanNum(row[colMap.roas]),                          // ROAS
+        cleanNum(row[colMap.budgetEst]),                     // Budget Est Next 3M
+        cleanNum(row[colMap.expResults]),                    // Expected Results
+        cleanNum(row[colMap.expConversions]),                // Expected Conversions
+        cleanNum(row[colMap.expRevenue])                     // Expected Revenue 3M
+      ];
+
+      master.appendRow(masterRow);
+      rowsWritten++;
+    }
+
+    Logger.log('Processed tab: ' + tabName + ' → Month: ' + monthLabel);
+  });
+
+  // ── 7. Sort master sheet by month order then course ───────
+  // Skip header row (row 1), sort from row 2 onwards
+  const lastRow = master.getLastRow();
+  if (lastRow > 2) {
+    master.getRange(2, 1, lastRow - 1, headers.length)
+      .sort([{column: 1, ascending: true}, {column: 3, ascending: true}]);
+  }
+
+  // ── 8. Format number columns ──────────────────────────────
+  // Spend, CPR, Revenue, CAC columns → Indian number format
+  const numCols = [5, 8, 13, 14, 15, 17, 20]; // col indices (1-based)
+  numCols.forEach(c => {
+    if (lastRow > 1) {
+      master.getRange(2, c, lastRow - 1, 1)
+        .setNumberFormat('#,##0.00');
+    }
+  });
+
+  // ROAS column → 2 decimal places
+  if (lastRow > 1) {
+    master.getRange(2, 16, lastRow - 1, 1).setNumberFormat('0.00');
+    // CVR column → percentage display
+    master.getRange(2, 10, lastRow - 1, 1).setNumberFormat('0.00"%"');
+  }
+
+  // ── 9. Done ───────────────────────────────────────────────
+  SpreadsheetApp.getUi().alert(
+    'SE_Master created successfully!\n' +
+    rowsWritten + ' data rows written.\n\n' +
+    'New month tabs added later will be picked up\nautomatically when you run this script again,\nor set up the auto-trigger (Step 3).'
+  );
+
+  Logger.log('Done. Total rows written: ' + rowsWritten);
+}
+
+
+// ============================================================
+// AUTO-TRIGGER SETUP (Step 3 from checklist)
+// Run this function ONCE to set up automatic detection
+// of new month tabs — runs every night at midnight
+// ============================================================
+
+function setupAutoTrigger() {
+  // Remove any existing triggers for this function first
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'consolidateSEMaster') {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+
+  // Set new nightly trigger at midnight
+  ScriptApp.newTrigger('consolidateSEMaster')
+    .timeBased()
+    .everyDays(1)
+    .atHour(0)
+    .create();
+
+  SpreadsheetApp.getUi().alert(
+    'Auto-trigger set!\n\n' +
+    'SE_Master will update automatically every night at midnight.\n' +
+    'New month tabs will be picked up without any manual action.'
+  );
+}
+
