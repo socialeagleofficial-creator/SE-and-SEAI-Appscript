@@ -1,0 +1,354 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// SEAI - 2026 AD Spent Data | Sync Script
+// Paste this into Apps Script of: SEAI - 2026 AD Spent data
+//
+// WHAT IT DOES:
+//   1. Reads Monthly Spend, Total Result, Total Optin from SE DAS Report
+//      (August 26-27 tab — the Course Performance Dashboard summary table)
+//   2. Creates "AI - August" tab by copying "AI - July" structure
+//   3. Fills in Monthly Spend (Col B), Optin (Col C), Result (Col D)
+//   4. Recalculates CPR in Col E
+//
+// COURSES IN AI - August tab:
+//   AI, AI WORKSHOP (following AI - July pattern)
+//
+// HOW TO RUN:
+//   - Run syncAugustSEAI() manually to fill August data
+//   - Run setupMonthlyTrigger() once to auto-run on 1st of each month
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── CONFIG ────────────────────────────────────────────────────────────────────
+var SE_DAS_REPORT_ID = '1s7fUe5d0pwg40D4CBzoVbXB6ZYz1Xy8hUQZ2R3Ku-w8';
+
+// Course groups for SEAI sheet
+// Following AI - July pattern: one tab "AI - August" with AI + AI WORKSHOP
+var SEAI_TAB_GROUPS = {
+  'AI': ['AI', 'AI WORKSHOP', 'AI FOR BO'],
+};
+
+// Conversion types per course
+var CONVERSION_TYPES = {
+  'AI':          'Full Course',
+  'AI WORKSHOP': 'Full Course',
+  'AI FOR BO':   'Full Course',
+};
+
+// Value Per Conversion per course (₹)
+var VALUE_PER_CONVERSION = {
+  'AI':          50000,
+  'AI WORKSHOP': 50000,
+  'AI FOR BO':   50000,
+};
+
+// ── MAIN FUNCTION ─────────────────────────────────────────────────────────────
+function syncAugustSEAI() {
+  var month = 'August';
+
+  // To auto-detect current month, uncomment:
+  // var tz    = Session.getScriptTimeZone();
+  // var month = Utilities.formatDate(new Date(), tz, 'MMMM');
+
+  Logger.log('═══ SEAI AD Spent Sync — ' + month + ' ═══');
+
+  // Step 1: Read data from SE DAS Report
+  var dasData = readDasReportDataSEAI(month);
+  if (!dasData) {
+    Logger.log('❌ Could not read SE DAS Report. Aborting.');
+    return;
+  }
+  Logger.log('✅ SE DAS Report data read. Courses found: ' + Object.keys(dasData).join(', '));
+
+  // Step 2: Create/update tabs for each group
+  var thisSS = SpreadsheetApp.getActiveSpreadsheet();
+
+  Object.keys(SEAI_TAB_GROUPS).forEach(function(groupName) {
+    var tabName      = groupName + ' - ' + month;  // "AI - August"
+    var templateTab  = groupName + ' - July';       // "AI - July"
+    var courses      = SEAI_TAB_GROUPS[groupName];
+
+    Logger.log('\n── Processing tab: ' + tabName + ' ──');
+
+    var sheet = getOrCreateTabSEAI(thisSS, tabName, templateTab);
+    if (!sheet) {
+      Logger.log('❌ Could not get/create tab: ' + tabName);
+      return;
+    }
+
+    fillTabDataSEAI(sheet, courses, dasData, month, groupName);
+    Logger.log('✅ Tab filled: ' + tabName);
+  });
+
+  // Step 3: Update SEAI_Master tab
+  updateSEAIMasterTab(thisSS, dasData, month);
+
+  Logger.log('\n═══ Sync complete ═══');
+}
+
+// ── READ FROM SE DAS REPORT ───────────────────────────────────────────────────
+// Reads the Course Performance Dashboard table from the August tab
+// Returns: { 'AI': { spend, result, optin }, 'AI WORKSHOP': {...}, ... }
+function readDasReportDataSEAI(month) {
+  try {
+    var ss = SpreadsheetApp.openById(SE_DAS_REPORT_ID);
+
+    var sheet = findMonthTabSEAI(ss, month);
+    if (!sheet) {
+      Logger.log('❌ Could not find ' + month + ' tab in SE DAS Report');
+      return null;
+    }
+    Logger.log('Found DAS tab: ' + sheet.getName());
+
+    var data   = sheet.getDataRange().getValues();
+    var result = {};
+
+    // Find the summary header row
+    var headerRow = -1;
+    var colCourse = -1, colSpend = -1, colResult = -1, colOptin = -1;
+
+    for (var i = 0; i < data.length; i++) {
+      var row = data[i].map(function(c) { return (c || '').toString().trim(); });
+      if (row[0] === 'Course Name' && row.indexOf('Monthly Spend') !== -1) {
+        headerRow = i;
+        colCourse = 0;
+        colSpend  = row.indexOf('Monthly Spend');
+        colResult = row.indexOf('Total Result');
+        colOptin  = row.indexOf('Total Optin');
+        if (colOptin === -1) colOptin = row.indexOf('Optin');
+        Logger.log('Header at row ' + (i+1) + ' | Spend:' + colSpend + ' Result:' + colResult + ' Optin:' + colOptin);
+        break;
+      }
+    }
+
+    if (headerRow === -1) {
+      Logger.log('❌ Could not find summary table header');
+      return null;
+    }
+
+    // Read AI-related courses only
+    var aiCourses = ['AI', 'AI WORKSHOP', 'AI FOR BO', 'AI SEMINAR BO'];
+
+    for (var i = headerRow + 1; i < data.length; i++) {
+      var courseName = (data[i][colCourse] || '').toString().trim();
+      if (!courseName || courseName === 'Date') break;
+
+      var courseUpper = courseName.toUpperCase();
+      // Only capture AI courses for SEAI sheet
+      var isAiCourse = aiCourses.some(function(c) { return courseUpper === c; });
+      if (!isAiCourse) continue;
+
+      var spend = parseNumberSEAI(data[i][colSpend]);
+      var res   = parseNumberSEAI(data[i][colResult]);
+      var optin = colOptin !== -1 ? parseNumberSEAI(data[i][colOptin]) : 0;
+
+      if (spend > 0 || res > 0) {
+        result[courseUpper] = {
+          spend:  spend,
+          result: res,
+          optin:  optin,
+          name:   courseName,
+        };
+        Logger.log('  ' + courseName + ': spend=₹' + Math.round(spend) + ' result=' + res + ' optin=' + optin);
+      }
+    }
+
+    return result;
+
+  } catch(e) {
+    Logger.log('❌ Error reading SE DAS Report: ' + e);
+    return null;
+  }
+}
+
+// ── FIND MONTH TAB ────────────────────────────────────────────────────────────
+function findMonthTabSEAI(ss, month) {
+  var sheets = ss.getSheets();
+  var monthUpper = month.toUpperCase();
+  var monthShort = month.substring(0, 3).toUpperCase();
+
+  for (var i = 0; i < sheets.length; i++) {
+    var name = sheets[i].getName().toUpperCase();
+    if (name.indexOf(monthUpper) !== -1 || name.indexOf(monthShort) !== -1) {
+      return sheets[i];
+    }
+  }
+  return null;
+}
+
+// ── GET OR CREATE TAB ─────────────────────────────────────────────────────────
+function getOrCreateTabSEAI(ss, tabName, templateTabName) {
+  var existing = ss.getSheetByName(tabName);
+  if (existing) {
+    Logger.log('Tab already exists: ' + tabName + ' — will update data');
+    return existing;
+  }
+
+  var template = ss.getSheetByName(templateTabName);
+  if (!template) {
+    Logger.log('❌ Template tab not found: ' + templateTabName);
+    return ss.insertSheet(tabName);
+  }
+
+  var newSheet = template.copyTo(ss);
+  newSheet.setName(tabName);
+
+  var templateIndex = template.getIndex();
+  ss.moveActiveSheet(templateIndex + 1);
+
+  Logger.log('Created: ' + tabName + ' (from ' + templateTabName + ')');
+  return newSheet;
+}
+
+// ── FILL TAB DATA ─────────────────────────────────────────────────────────────
+function fillTabDataSEAI(sheet, courses, dasData, month, groupName) {
+  var data    = sheet.getDataRange().getValues();
+  var headers = data[0].map(function(c) { return (c || '').toString().trim(); });
+
+  var colCourse = 0;
+  var colSpend  = findColSEAI(headers, ['Monthly Spend', 'Monthly Spend (Without GST)']);
+  var colOptin  = findColSEAI(headers, ['Optin']);
+  var colResult = findColSEAI(headers, ['Result']);
+  var colCPR    = findColSEAI(headers, ['CPR']);
+
+  Logger.log('Columns — Spend:' + colSpend + ' Optin:' + colOptin + ' Result:' + colResult + ' CPR:' + colCPR);
+
+  // Map course names to row indices
+  var courseRowMap = {};
+  var totalRow     = -1;
+
+  for (var i = 1; i < data.length; i++) {
+    var cellVal = (data[i][colCourse] || '').toString().trim().toUpperCase();
+    if (cellVal === 'TOTAL') { totalRow = i; break; }
+    if (cellVal) courseRowMap[cellVal] = i;
+  }
+
+  var totalSpend = 0, totalOptin = 0, totalResult = 0;
+
+  courses.forEach(function(courseName) {
+    var key      = courseName.toUpperCase();
+    var dasEntry = dasData[key];
+
+    if (!dasEntry) {
+      Logger.log('  ⚠️ No data for: ' + courseName);
+      return;
+    }
+
+    var rowIdx = courseRowMap[key];
+    if (rowIdx === undefined) {
+      Logger.log('  ⚠️ No row found for: ' + courseName);
+      return;
+    }
+
+    var sheetRow = rowIdx + 1;
+    var spend    = dasEntry.spend;
+    var result   = dasEntry.result;
+    var optin    = dasEntry.optin;
+    var cpr      = result > 0 ? spend / result : 0;
+
+    if (colSpend  !== -1) sheet.getRange(sheetRow, colSpend  + 1).setValue(spend);
+    if (colOptin  !== -1) sheet.getRange(sheetRow, colOptin  + 1).setValue(optin);
+    if (colResult !== -1) sheet.getRange(sheetRow, colResult + 1).setValue(result);
+    if (colCPR    !== -1) sheet.getRange(sheetRow, colCPR    + 1).setValue(Math.round(cpr * 100) / 100);
+
+    totalSpend  += spend;
+    totalOptin  += optin;
+    totalResult += result;
+
+    Logger.log('  ✅ ' + courseName + ' [row ' + sheetRow + ']: spend=₹' + Math.round(spend) + ' optin=' + optin + ' result=' + result);
+  });
+
+  // Update Total row
+  if (totalRow !== -1) {
+    var totalSheetRow = totalRow + 1;
+    var totalCPR = totalResult > 0 ? totalSpend / totalResult : 0;
+
+    if (colSpend  !== -1) sheet.getRange(totalSheetRow, colSpend  + 1).setValue(totalSpend);
+    if (colOptin  !== -1) sheet.getRange(totalSheetRow, colOptin  + 1).setValue(totalOptin);
+    if (colResult !== -1) sheet.getRange(totalSheetRow, colResult + 1).setValue(totalResult);
+    if (colCPR    !== -1) sheet.getRange(totalSheetRow, colCPR    + 1).setValue(Math.round(totalCPR * 100) / 100);
+
+    Logger.log('  ✅ Total: spend=₹' + Math.round(totalSpend) + ' optin=' + totalOptin + ' result=' + totalResult);
+  }
+}
+
+// ── UPDATE SEAI_MASTER TAB ────────────────────────────────────────────────────
+function updateSEAIMasterTab(ss, dasData, month) {
+  var masterSheet = ss.getSheetByName('SEAI_Master');
+  if (!masterSheet) {
+    Logger.log('⚠️ SEAI_Master tab not found — skipping');
+    return;
+  }
+
+  var masterData = masterSheet.getDataRange().getValues();
+  var monthLabel = month + ' 2026';
+
+  // Check if August already exists
+  for (var i = 1; i < masterData.length; i++) {
+    if ((masterData[i][0] || '').toString().indexOf(month) !== -1) {
+      Logger.log('SEAI_Master: ' + month + ' rows already exist — skipping');
+      return;
+    }
+  }
+
+  var allCourses = [];
+  Object.keys(SEAI_TAB_GROUPS).forEach(function(g) {
+    SEAI_TAB_GROUPS[g].forEach(function(c) { allCourses.push(c); });
+  });
+
+  allCourses.forEach(function(courseName) {
+    var key = courseName.toUpperCase();
+    var d   = dasData[key];
+    if (!d || d.spend === 0) return;
+
+    var cpr = d.result > 0 ? d.spend / d.result : 0;
+    var row = [
+      monthLabel, 'SEAI', courseName,
+      CONVERSION_TYPES[courseName] || 'Full Course',
+      d.spend, d.optin, d.result,
+      Math.round(cpr * 100) / 100,
+      '', '', '',
+      VALUE_PER_CONVERSION[courseName] || '',
+      '', '', '', '',
+    ];
+    masterSheet.appendRow(row);
+    Logger.log('SEAI_Master: appended ' + courseName);
+  });
+
+  Logger.log('✅ SEAI_Master updated');
+}
+
+// ── HELPERS ───────────────────────────────────────────────────────────────────
+function findColSEAI(headers, names) {
+  for (var i = 0; i < names.length; i++) {
+    var idx = headers.indexOf(names[i]);
+    if (idx !== -1) return idx;
+  }
+  return -1;
+}
+
+function parseNumberSEAI(val) {
+  if (typeof val === 'number') return val;
+  var str = (val || '').toString().replace(/[₹,\s]/g, '');
+  var num = parseFloat(str);
+  return isNaN(num) ? 0 : num;
+}
+
+// ── MONTHLY TRIGGER ───────────────────────────────────────────────────────────
+function setupMonthlyTrigger() {
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    if (t.getHandlerFunction() === 'syncAugustSEAI') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('syncAugustSEAI')
+    .timeBased().onMonthDay(1).atHour(8).create();
+  Logger.log('✅ Monthly trigger set: runs on 1st of every month at 8 AM');
+}
+
+// ── TEST FUNCTION ─────────────────────────────────────────────────────────────
+function testReadDasDataSEAI() {
+  var data = readDasReportDataSEAI('August');
+  if (!data) { Logger.log('❌ Failed'); return; }
+  Logger.log('✅ Data read:');
+  Object.keys(data).forEach(function(k) {
+    var d = data[k];
+    Logger.log('  ' + k + ': spend=₹' + Math.round(d.spend) + ' result=' + d.result + ' optin=' + d.optin);
+  });
+}
