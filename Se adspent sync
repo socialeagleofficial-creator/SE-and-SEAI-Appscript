@@ -1,0 +1,409 @@
+// ══════════════════════════════════════════════════════════════════════════════
+// SE - 2026 AD Spent Data | Sync Script
+// Paste this into Apps Script of: SE - 2026 AD Spent data
+//
+// WHAT IT DOES:
+//   1. Reads Monthly Spend, Total Result, Total Optin from SE DAS Report
+//      (August 26-27 tab — the Course Performance Dashboard summary table)
+//   2. Creates new tabs: "DM - August" and "SOS - August" (if they don't exist)
+//      by copying the structure from "DM - July" and "SOS - July"
+//   3. Fills in Monthly Spend (Col B), Optin (Col C), Result (Col D) for each course
+//   4. Recalculates CPR = Monthly Spend / Result in Col E
+//
+// COURSES IN DM - August tab:
+//   DM, DM BO PAID, DM HW PAID, DM 2DC
+//
+// COURSES IN SOS - August tab:
+//   SOS, SOS MS
+//
+// HOW TO RUN:
+//   - Run syncAugustSE() manually to fill August data
+//   - Run setupMonthlyTrigger() once to auto-run on the 1st of each month
+//
+// HOW TO ADD A NEW MONTH (e.g. September):
+//   - The script auto-detects the current month. Just run it next month
+//     and it will create "DM - September" and "SOS - September" automatically.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── CONFIG ────────────────────────────────────────────────────────────────────
+var SE_DAS_REPORT_ID = '1s7fUe5d0pwg40D4CBzoVbXB6ZYz1Xy8hUQZ2R3Ku-w8';
+
+// Course groups for SE sheet
+// Each group becomes one tab: "DM - August", "SOS - August"
+var SE_TAB_GROUPS = {
+  'DM': ['DM', 'DM BO PAID', 'DM HW PAID', 'DM 2DC'],
+  'SOS': ['SOS', 'SOS MS'],
+};
+
+// Conversion types per course (matches July tab)
+var CONVERSION_TYPES = {
+  'DM':         'Full Course',
+  'DM BO PAID': 'Full Course',
+  'DM HW PAID': 'Full Course',
+  'DM 2DC':     '5 Day Challenge',
+  'SOS':        'Full Course',
+  'SOS MS':     'Full Course',
+};
+
+// Value Per Conversion per course (₹, used for Total Conversion Value)
+var VALUE_PER_CONVERSION = {
+  'DM':         59000,
+  'DM BO PAID': 59000,
+  'DM HW PAID': 59000,
+  'DM 2DC':     4999,
+  'SOS':        40000,
+  'SOS MS':     40000,
+};
+
+// ── MAIN FUNCTION ─────────────────────────────────────────────────────────────
+function syncAugustSE() {
+  var tz    = Session.getScriptTimeZone();
+  var month = 'August'; // hardcoded for August — change to auto-detect below if needed
+
+  // To auto-detect current month, uncomment:
+  // var month = Utilities.formatDate(new Date(), tz, 'MMMM');
+  // var year  = Utilities.formatDate(new Date(), tz, 'yyyy');
+
+  Logger.log('═══ SE AD Spent Sync — ' + month + ' ═══');
+
+  // Step 1: Read data from SE DAS Report
+  var dasData = readDasReportData(month);
+  if (!dasData) {
+    Logger.log('❌ Could not read SE DAS Report. Aborting.');
+    return;
+  }
+  Logger.log('✅ SE DAS Report data read. Courses found: ' + Object.keys(dasData).join(', '));
+
+  // Step 2: Create/update tabs for each group
+  var thisSS = SpreadsheetApp.getActiveSpreadsheet();
+
+  Object.keys(SE_TAB_GROUPS).forEach(function(groupName) {
+    var tabName    = groupName + ' - ' + month;  // e.g. "DM - August"
+    var templateTab = groupName + ' - July';      // e.g. "DM - July"
+    var courses    = SE_TAB_GROUPS[groupName];
+
+    Logger.log('\n── Processing tab: ' + tabName + ' ──');
+
+    // Get or create the tab
+    var sheet = getOrCreateTab(thisSS, tabName, templateTab);
+    if (!sheet) {
+      Logger.log('❌ Could not get/create tab: ' + tabName);
+      return;
+    }
+
+    // Fill in data
+    fillTabData(sheet, courses, dasData, month, groupName);
+    Logger.log('✅ Tab filled: ' + tabName);
+  });
+
+  // Step 3: Update SE_Master tab
+  updateSEMasterTab(thisSS, dasData, month);
+
+  Logger.log('\n═══ Sync complete ═══');
+}
+
+// ── READ FROM SE DAS REPORT ───────────────────────────────────────────────────
+// Reads the Course Performance Dashboard summary table from the August tab
+// Returns: { 'DM': { spend: 326112.44, result: 486, optin: 347 }, ... }
+function readDasReportData(month) {
+  try {
+    var ss = SpreadsheetApp.openById(SE_DAS_REPORT_ID);
+
+    // Find the August tab — named like "AUGUST 26" or "August 2026"
+    var sheet = findMonthTab(ss, month);
+    if (!sheet) {
+      Logger.log('❌ Could not find ' + month + ' tab in SE DAS Report');
+      return null;
+    }
+    Logger.log('Found DAS tab: ' + sheet.getName());
+
+    var data = sheet.getDataRange().getValues();
+    var result = {};
+
+    // Find the Course Performance Dashboard summary table
+    // It has headers: Course Name | Monthly Spend | ... | Total Result | ... | Total Optin
+    var headerRow = -1;
+    var colCourse = -1, colSpend = -1, colResult = -1, colOptin = -1;
+
+    for (var i = 0; i < data.length; i++) {
+      var row = data[i].map(function(c) { return (c || '').toString().trim(); });
+      // Look for the header row of the summary table
+      if (row[0] === 'Course Name' && row.indexOf('Monthly Spend') !== -1) {
+        headerRow = i;
+        colCourse = 0;
+        colSpend  = row.indexOf('Monthly Spend');
+        colResult = row.indexOf('Total Result');
+        colOptin  = row.indexOf('Total Optin');
+        // If Total Optin not found, try just 'Optin'
+        if (colOptin === -1) colOptin = row.indexOf('Optin');
+        Logger.log('Header found at row ' + (i+1) + ' | Spend col: ' + colSpend + ' | Result col: ' + colResult + ' | Optin col: ' + colOptin);
+        break;
+      }
+    }
+
+    if (headerRow === -1) {
+      Logger.log('❌ Could not find Course Performance Dashboard header in ' + sheet.getName());
+      return null;
+    }
+
+    // Read course rows until blank or next section
+    for (var i = headerRow + 1; i < data.length; i++) {
+      var courseName = (data[i][colCourse] || '').toString().trim();
+      if (!courseName || courseName === 'Date') break; // end of summary table
+
+      var spend  = parseNumber(data[i][colSpend]);
+      var res    = parseNumber(data[i][colResult]);
+      var optin  = colOptin !== -1 ? parseNumber(data[i][colOptin]) : 0;
+
+      if (spend > 0 || res > 0) {
+        result[courseName.toUpperCase()] = {
+          spend:  spend,
+          result: res,
+          optin:  optin,
+          name:   courseName, // preserve original casing
+        };
+        Logger.log('  ' + courseName + ': spend=₹' + Math.round(spend) + ' result=' + res + ' optin=' + optin);
+      }
+    }
+
+    return result;
+
+  } catch(e) {
+    Logger.log('❌ Error reading SE DAS Report: ' + e);
+    return null;
+  }
+}
+
+// ── FIND MONTH TAB IN SE DAS REPORT ──────────────────────────────────────────
+function findMonthTab(ss, month) {
+  var sheets = ss.getSheets();
+  var monthUpper = month.toUpperCase(); // "AUGUST"
+  var monthShort = month.substring(0, 3).toUpperCase(); // "AUG"
+
+  for (var i = 0; i < sheets.length; i++) {
+    var name = sheets[i].getName().toUpperCase();
+    // Match patterns: "AUGUST 26", "AUG 26", "AUGUST 2026", "AUG 2026"
+    if (name.indexOf(monthUpper) !== -1 || name.indexOf(monthShort) !== -1) {
+      return sheets[i];
+    }
+  }
+  return null;
+}
+
+// ── GET OR CREATE TAB ─────────────────────────────────────────────────────────
+function getOrCreateTab(ss, tabName, templateTabName) {
+  // Check if tab already exists
+  var existing = ss.getSheetByName(tabName);
+  if (existing) {
+    Logger.log('Tab already exists: ' + tabName + ' — will update data');
+    return existing;
+  }
+
+  // Copy from template tab
+  var template = ss.getSheetByName(templateTabName);
+  if (!template) {
+    Logger.log('❌ Template tab not found: ' + templateTabName + '. Creating blank tab.');
+    return ss.insertSheet(tabName);
+  }
+
+  // Duplicate the template and rename
+  var newSheet = template.copyTo(ss);
+  newSheet.setName(tabName);
+
+  // Move it right after the template
+  var templateIndex = template.getIndex();
+  ss.moveActiveSheet(templateIndex + 1);
+
+  Logger.log('Created new tab: ' + tabName + ' (copied from ' + templateTabName + ')');
+  return newSheet;
+}
+
+// ── FILL TAB DATA ─────────────────────────────────────────────────────────────
+// Fills Monthly Spend, Optin, Result, CPR for each course row
+// Also updates the Total row at the bottom
+function fillTabData(sheet, courses, dasData, month, groupName) {
+  var data = sheet.getDataRange().getValues();
+
+  // Find header row to know column positions
+  var headerRow = 0; // row 1 (index 0) is always headers
+  var headers = data[0].map(function(c) { return (c || '').toString().trim(); });
+
+  var colCourse = 0; // A — always Course Name
+  var colSpend  = findCol(headers, ['Monthly Spend', 'Monthly Spend (Without GST)']);
+  var colOptin  = findCol(headers, ['Optin']);
+  var colResult = findCol(headers, ['Result']);
+  var colCPR    = findCol(headers, ['CPR']);
+
+  Logger.log('Columns — Spend:' + colSpend + ' Optin:' + colOptin + ' Result:' + colResult + ' CPR:' + colCPR);
+
+  // Build a map of existing course rows (row index → course name)
+  var courseRowMap = {}; // { 'DM': 1, 'DM BO PAID': 2, ... } (0-based index)
+  var totalRow = -1;
+
+  for (var i = 1; i < data.length; i++) {
+    var cellVal = (data[i][colCourse] || '').toString().trim().toUpperCase();
+    if (cellVal === 'TOTAL') { totalRow = i; break; }
+    if (cellVal) courseRowMap[cellVal] = i;
+  }
+
+  // Track totals for the Total row
+  var totalSpend = 0, totalOptin = 0, totalResult = 0;
+
+  // Update each course row
+  courses.forEach(function(courseName) {
+    var key = courseName.toUpperCase();
+    var dasEntry = dasData[key];
+
+    if (!dasEntry) {
+      Logger.log('  ⚠️ No data for course: ' + courseName + ' (key: ' + key + ')');
+      return;
+    }
+
+    var rowIdx = courseRowMap[key];
+    if (rowIdx === undefined) {
+      Logger.log('  ⚠️ No row found for: ' + courseName + ' in tab');
+      return;
+    }
+
+    var sheetRow = rowIdx + 1; // 1-based
+    var spend    = dasEntry.spend;
+    var result   = dasEntry.result;
+    var optin    = dasEntry.optin;
+    var cpr      = result > 0 ? spend / result : 0;
+
+    // Write the three main columns
+    if (colSpend  !== -1) sheet.getRange(sheetRow, colSpend  + 1).setValue(spend);
+    if (colOptin  !== -1) sheet.getRange(sheetRow, colOptin  + 1).setValue(optin);
+    if (colResult !== -1) sheet.getRange(sheetRow, colResult + 1).setValue(result);
+    if (colCPR    !== -1) sheet.getRange(sheetRow, colCPR    + 1).setValue(Math.round(cpr * 100) / 100);
+
+    totalSpend  += spend;
+    totalOptin  += optin;
+    totalResult += result;
+
+    Logger.log('  ✅ ' + courseName + ' [row ' + sheetRow + ']: spend=₹' + Math.round(spend) + ' optin=' + optin + ' result=' + result + ' CPR=₹' + Math.round(cpr));
+  });
+
+  // Update Total row
+  if (totalRow !== -1) {
+    var totalSheetRow = totalRow + 1;
+    var totalCPR = totalResult > 0 ? totalSpend / totalResult : 0;
+
+    if (colSpend  !== -1) sheet.getRange(totalSheetRow, colSpend  + 1).setValue(totalSpend);
+    if (colOptin  !== -1) sheet.getRange(totalSheetRow, colOptin  + 1).setValue(totalOptin);
+    if (colResult !== -1) sheet.getRange(totalSheetRow, colResult + 1).setValue(totalResult);
+    if (colCPR    !== -1) sheet.getRange(totalSheetRow, colCPR    + 1).setValue(Math.round(totalCPR * 100) / 100);
+
+    Logger.log('  ✅ Total row updated: spend=₹' + Math.round(totalSpend) + ' optin=' + totalOptin + ' result=' + totalResult);
+  }
+}
+
+// ── UPDATE SE_MASTER TAB ──────────────────────────────────────────────────────
+// Adds August rows to SE_Master if not already there
+function updateSEMasterTab(ss, dasData, month) {
+  var masterSheet = ss.getSheetByName('SE_Master');
+  if (!masterSheet) {
+    Logger.log('⚠️ SE_Master tab not found — skipping master update');
+    return;
+  }
+
+  var masterData  = masterSheet.getDataRange().getValues();
+  var monthLabel  = month + ' 2026'; // "August 2026"
+  var lastRow     = masterSheet.getLastRow();
+
+  // Check if August rows already exist
+  var alreadyExists = false;
+  for (var i = 1; i < masterData.length; i++) {
+    if ((masterData[i][0] || '').toString().indexOf(month) !== -1) {
+      alreadyExists = true;
+      break;
+    }
+  }
+
+  if (alreadyExists) {
+    Logger.log('SE_Master: ' + month + ' rows already exist — skipping');
+    return;
+  }
+
+  // Add rows for each course group
+  var allCourses = [];
+  Object.keys(SE_TAB_GROUPS).forEach(function(group) {
+    SE_TAB_GROUPS[group].forEach(function(c) { allCourses.push(c); });
+  });
+
+  allCourses.forEach(function(courseName) {
+    var key = courseName.toUpperCase();
+    var d   = dasData[key];
+    if (!d || d.spend === 0) return;
+
+    var cpr = d.result > 0 ? d.spend / d.result : 0;
+    var row = [
+      monthLabel,        // Month
+      'SE',              // Brand
+      courseName,        // Course
+      CONVERSION_TYPES[courseName] || 'Full Course', // Conversion Type
+      d.spend,           // Spend
+      d.optin,           // Optins
+      d.result,          // Results
+      Math.round(cpr * 100) / 100, // CPR
+      '',                // Conversions (manual)
+      '',                // Conversion Rate (manual)
+      '',                // CAC (manual)
+      VALUE_PER_CONVERSION[courseName] || '', // Value Per Conversion
+      '',                // Revenue Thru Registration (manual)
+      '',                // Total Conversion Value (manual)
+      '',                // Total Revenue (manual)
+      '',                // ROAS (manual)
+    ];
+
+    masterSheet.appendRow(row);
+    Logger.log('SE_Master: appended row for ' + courseName);
+  });
+
+  Logger.log('✅ SE_Master updated for ' + month);
+}
+
+// ── HELPER: FIND COLUMN INDEX ─────────────────────────────────────────────────
+function findCol(headers, possibleNames) {
+  for (var i = 0; i < possibleNames.length; i++) {
+    var idx = headers.indexOf(possibleNames[i]);
+    if (idx !== -1) return idx;
+  }
+  return -1;
+}
+
+// ── HELPER: PARSE NUMBER ──────────────────────────────────────────────────────
+function parseNumber(val) {
+  if (typeof val === 'number') return val;
+  var str = (val || '').toString().replace(/[₹,\s]/g, '');
+  var num = parseFloat(str);
+  return isNaN(num) ? 0 : num;
+}
+
+// ── SETUP MONTHLY TRIGGER ─────────────────────────────────────────────────────
+// Run this ONCE to schedule auto-sync on 1st of every month
+function setupMonthlyTrigger() {
+  // Delete existing triggers
+  ScriptApp.getProjectTriggers().forEach(function(t) {
+    if (t.getHandlerFunction() === 'syncAugustSE') ScriptApp.deleteTrigger(t);
+  });
+
+  ScriptApp.newTrigger('syncAugustSE')
+    .timeBased()
+    .onMonthDay(1)
+    .atHour(8)
+    .create();
+
+  Logger.log('✅ Monthly trigger set: runs on 1st of every month at 8 AM');
+}
+
+// ── TEST FUNCTION ─────────────────────────────────────────────────────────────
+function testReadDasData() {
+  var data = readDasReportData('August');
+  if (!data) { Logger.log('❌ Failed to read data'); return; }
+  Logger.log('✅ Data read successfully:');
+  Object.keys(data).forEach(function(k) {
+    var d = data[k];
+    Logger.log('  ' + k + ': spend=₹' + Math.round(d.spend) + ' result=' + d.result + ' optin=' + d.optin);
+  });
+}
